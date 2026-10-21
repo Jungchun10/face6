@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>얼굴 좌표 인식</title>
+  <style>
+    body{font-family:system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;background:#f5f7fb;color:#172033}
+    h1{font-size:1.7rem} .panel{background:white;border-radius:14px;padding:16px;box-shadow:0 2px 12px #0001;margin:14px 0}
+    button{border:0;border-radius:9px;padding:11px 16px;background:#2457d6;color:white;font-size:1rem;cursor:pointer;margin:4px}
+    button:disabled{opacity:.5;cursor:default} .stage{position:relative;max-width:100%;background:#111;border-radius:12px;overflow:hidden}
+    video{display:block;width:100%;height:auto;transform:scaleX(-1)} canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1)}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.stat{background:#f0f4ff;padding:12px;border-radius:10px}
+    .value{font-weight:700;font-size:1.2rem}.warning{color:#b42318;font-weight:700}.muted{color:#5b6475;font-size:.92rem}
+  </style>
+</head>
+<body>
+  <h1>얼굴 좌표 인식</h1>
+  <p class="muted">웹캠에서 가장 큰 얼굴 하나를 추적합니다. 카메라 권한과 인터넷 연결이 필요합니다.</p>
+  <div class="panel">
+    <button id="start">카메라 시작</button><button id="stop" disabled>중지</button>
+    <p id="status" role="status">시작 버튼을 눌러 주세요.</p>
+    <div class="stage"><video id="video" autoplay muted playsinline></video><canvas id="overlay"></canvas></div>
+  </div>
+  <div class="panel stats">
+    <div class="stat">X 좌표<div class="value" id="x">-</div></div>
+    <div class="stat">Y 좌표<div class="value" id="y">-</div></div>
+    <div class="stat">Pitch (추정)<div class="value" id="pitch">-</div></div>
+    <div class="stat">Roll (추정)<div class="value" id="roll">-</div></div>
+  </div>
+  <div class="panel"><div id="warning">얼굴이 감지되지 않았습니다.</div><p class="muted">좌표는 영상 크기 기준 픽셀입니다. Pitch/Roll은 얼굴 특징점으로 계산한 근삿값이며 정확한 자세 측정값이 아닙니다.</p></div>
+<script type="module">
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+let stream = null, landmarker = null, running = false, raf = 0;
+const status = $('status');
+async function loadModel(){
+  const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs');
+  const files = await vision.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
+  return vision.FaceLandmarker.createFromOptions(files, {
+    baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate:'CPU'},
+    runningMode:'VIDEO', numFaces:5, outputFaceBlendshapes:false, outputFacialTransformationMatrixes:false
+  });
+}
+function loop(){
+  if(!running || video.readyState < 2){raf=requestAnimationFrame(loop);return;}
+  const w=video.videoWidth,h=video.videoHeight;
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}
+  ctx.clearRect(0,0,w,h);
+  try{
+    const result=landmarker.detectForVideo(video,performance.now());
+    const faces=result.faceLandmarks||[];
+    if(!faces.length){$('x').textContent='-';$('y').textContent='-';$('pitch').textContent='-';$('roll').textContent='-';$('warning').textContent='얼굴이 감지되지 않았습니다.';}
+    else{
+      // 가장 큰 얼굴을 선택합니다.
+      let face=faces[0], best=-1, bounds;
+      for(const f of faces){let xs=f.map(p=>p.x),ys=f.map(p=>p.y);let b={x0:Math.min(...xs),x1:Math.max(...xs),y0:Math.min(...ys),y1:Math.max(...ys)};let area=(b.x1-b.x0)*(b.y1-b.y0);if(area>best){best=area;face=f;bounds=b;}}
+      if(!bounds){let xs=face.map(p=>p.x),ys=face.map(p=>p.y);bounds={x0:Math.min(...xs),x1:Math.max(...xs),y0:Math.min(...ys),y1:Math.max(...ys)};}
+      const cx=(bounds.x0+bounds.x1)/2,cy=(bounds.y0+bounds.y1)/2;
+      $('x').textContent=Math.round(cx*w);$('y').textContent=Math.round(cy*h);
+      // Approximate head roll using eye corner landmarks 33 and 263.
+      const leftEye=face[33],rightEye=face[263];
+      const roll=Math.atan2((rightEye.y-leftEye.y)*h,(rightEye.x-leftEye.x)*w)*180/Math.PI;
+      // Approximate pitch from nose position relative to eye/mouth landmarks; not calibrated.
+      const nose=face[1],eyeMid=(face[159].y+face[386].y)/2,mouth=face[13].y;
+      const pitch=Math.max(-90,Math.min(90,((nose.y-eyeMid)/Math.max(.001,mouth-eyeMid)-.48)*100));
+      $('roll').textContent=roll.toFixed(1)+'°';$('pitch').textContent=pitch.toFixed(1)+'°';
+      const bw=(bounds.x1-bounds.x0)*w,bh=(bounds.y1-bounds.y0)*h;
+      $('warning').textContent=(bw/w>=0.55||bh/h>=0.72)?'⚠ 얼굴이 너무 가까워요. 조금 뒤로 이동하세요.':'얼굴이 정상적으로 감지되었습니다.';
+      $('warning').className=(bw/w>=0.55||bh/h>=0.72)?'warning':'';
+      ctx.strokeStyle='#22c55e';ctx.lineWidth=Math.max(2,w/320);ctx.strokeRect(bounds.x0*w,bounds.y0*h,(bounds.x1-bounds.x0)*w,(bounds.y1-bounds.y0)*h);
+      ctx.fillStyle='#ff3b30';ctx.beginPath();ctx.arc(cx*w,cy*h,Math.max(4,w/120),0,Math.PI*2);ctx.fill();
+    }
+  }catch(e){status.textContent='얼굴 인식 오류: '+e.message;}
+  raf=requestAnimationFrame(loop);
+}
+$('start').addEventListener('click',async()=>{
+  $('start').disabled=true;status.textContent='모델을 불러오는 중...';
+  try{
+    if(!landmarker)landmarker=await loadModel();
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+    video.srcObject=stream;await video.play();running=true;$('stop').disabled=false;status.textContent='실행 중';loop();
+  }catch(e){status.textContent='시작할 수 없습니다: '+e.message+' — HTTPS 주소인지, 카메라 권한과 인터넷 연결이 허용됐는지 확인해 주세요.';$('start').disabled=false;}
+});
+$('stop').addEventListener('click',()=>{running=false;cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;$('stop').disabled=true;$('start').disabled=false;ctx.clearRect(0,0,canvas.width,canvas.height);status.textContent='중지됨';});
+</script>
+</body>
+</html>
